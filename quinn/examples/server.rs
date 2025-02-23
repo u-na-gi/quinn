@@ -55,6 +55,12 @@ fn main() {
     )
     .unwrap();
     let opt = Opt::parse();
+
+    // このrootはexample/serverの中ってことでいいのかな
+    println!("root -> {:?}", opt.root);
+    println!("current dir -> {:?}", std::env::current_dir().unwrap());
+    // current dir -> "/Volumes/ssl-orca/workspace/my-apps/quinn"
+    // repository rootになるよね
     let code = {
         if let Err(e) = run(opt) {
             eprintln!("ERROR: {e}");
@@ -68,6 +74,7 @@ fn main() {
 
 #[tokio::main]
 async fn run(options: Opt) -> Result<()> {
+    // keyとかcertは渡してないが??
     let (certs, key) = if let (Some(key_path), Some(cert_path)) = (&options.key, &options.cert) {
         let key = fs::read(key_path).context("failed to read private key")?;
         let key = if key_path.extension().is_some_and(|x| x == "der") {
@@ -88,16 +95,25 @@ async fn run(options: Opt) -> Result<()> {
 
         (cert_chain, key)
     } else {
+        // 渡してないからこっちかな？？
+        println!("certs 渡してないよ");
+        //         ProjectDirs は、特定のアプリケーションのキャッシュ、設定、またはデータディレクトリの場所を計算する。
+        // これらのディレクトリの場所は、OS の標準ディレクトリ と プロジェクト / 組織の名前 に基づいて決定される。
         let dirs = directories_next::ProjectDirs::from("org", "quinn", "quinn-examples").unwrap();
         let path = dirs.data_local_dir();
+        println!("path -> {:?}", path);
         let cert_path = path.join("cert.der");
         let key_path = path.join("key.der");
         let (cert, key) = match fs::read(&cert_path).and_then(|x| Ok((x, fs::read(&key_path)?))) {
-            Ok((cert, key)) => (
-                CertificateDer::from(cert),
-                PrivateKeyDer::try_from(key).map_err(anyhow::Error::msg)?,
-            ),
+            Ok((cert, key)) => {
+                println!("あー何回か実行して作られてるからないように見えてたわけかあ");
+                (
+                    CertificateDer::from(cert),
+                    PrivateKeyDer::try_from(key).map_err(anyhow::Error::msg)?,
+                )
+            }
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
+                println!("cert.der, key.derがないよ");
                 info!("generating self-signed certificate");
                 let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
                 let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
