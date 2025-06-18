@@ -11,8 +11,8 @@ use tracing::trace;
 
 use super::assembler::Assembler;
 use crate::{
-    connection::StreamsState, crypto::Keys, frame, packet::SpaceId, range_set::ArrayRangeSet,
-    shared::IssuedCid, Dir, Duration, Instant, SocketAddr, StreamId, TransportError, VarInt,
+    Dir, Duration, Instant, SocketAddr, StreamId, TransportError, VarInt, connection::StreamsState,
+    crypto::Keys, frame, packet::SpaceId, range_set::ArrayRangeSet, shared::IssuedCid,
 };
 
 pub(super) struct PacketSpace {
@@ -129,12 +129,12 @@ impl PacketSpace {
             self.immediate_ack_pending = true;
         }
 
-        // Retransmit the data of the oldest in-flight packet
         if !self.pending.is_empty(streams) {
             // There's real data to send here, no need to make something up
             return;
         }
 
+        // Retransmit the data of the oldest in-flight packet
         for packet in self.sent_packets.values_mut() {
             if !packet.retransmits.is_empty(streams) {
                 // Remove retransmitted data from the old packet so we don't end up retransmitting
@@ -147,7 +147,9 @@ impl PacketSpace {
         // Nothing new to send and nothing to retransmit, so fall back on a ping. This should only
         // happen in rare cases during the handshake when the server becomes blocked by
         // anti-amplification.
-        self.ping_pending = true;
+        if !self.immediate_ack_pending {
+            self.ping_pending = true;
+        }
     }
 
     /// Get the next outgoing packet number in this space
@@ -464,7 +466,7 @@ impl Dedup {
     pub(super) fn insert(&mut self, packet: u64) -> bool {
         if let Some(diff) = packet.checked_sub(self.next) {
             // Right of window
-            self.window = (self.window << 1 | 1)
+            self.window = ((self.window << 1) | 1)
                 .checked_shl(cmp::min(diff, u64::from(u32::MAX)) as u32)
                 .unwrap_or(0);
             self.next = packet + 1;

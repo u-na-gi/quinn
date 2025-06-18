@@ -18,19 +18,19 @@ use rustls::crypto::aws_lc_rs::default_provider;
 #[cfg(feature = "rustls-ring")]
 use rustls::crypto::ring::default_provider;
 use rustls::{
+    AlertDescription, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     server::WebPkiClientVerifier,
-    AlertDescription, RootCertStore,
 };
 use tracing::info;
 
 use super::*;
 use crate::{
+    Duration, Instant,
     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
     crypto::rustls::QuicServerConfig,
     frame::FrameStruct,
     transport_parameters::TransportParameters,
-    Duration, Instant,
 };
 mod util;
 use util::*;
@@ -1077,7 +1077,7 @@ fn initial_retransmit() {
     );
     assert_matches!(
         pair.client_conn_mut(client_ch).poll(),
-        Some(Event::Connected { .. })
+        Some(Event::Connected)
     );
 }
 
@@ -1245,7 +1245,7 @@ fn server_hs_retransmit() {
     );
     assert_matches!(
         pair.client_conn_mut(client_ch).poll(),
-        Some(Event::Connected { .. })
+        Some(Event::Connected)
     );
 }
 
@@ -1558,8 +1558,8 @@ fn cid_rotation() {
     let mut stop = pair.time;
     let end = pair.time + 5 * CID_TIMEOUT;
 
-    use crate::cid_queue::CidQueue;
     use crate::LOC_CID_COUNT;
+    use crate::cid_queue::CidQueue;
     let mut active_cid_num = CidQueue::LEN as u64 + 1;
     active_cid_num = active_cid_num.min(LOC_CID_COUNT);
     let mut left_bound = 0;
@@ -1606,8 +1606,8 @@ fn cid_retirement() {
     assert!(!pair.server_conn_mut(server_ch).is_closed());
     assert_matches!(pair.client_conn_mut(client_ch).active_rem_cid_seq(), 1);
 
-    use crate::cid_queue::CidQueue;
     use crate::LOC_CID_COUNT;
+    use crate::cid_queue::CidQueue;
     let mut active_cid_num = CidQueue::LEN as u64;
     active_cid_num = active_cid_num.min(LOC_CID_COUNT);
 
@@ -1780,6 +1780,100 @@ fn congested_tail_loss() {
     pair.client_send(client_ch, s).write(&[42; 1024]).unwrap();
 }
 
+// Send a tail-loss probe when GSO segment_size is less than INITIAL_MTU
+#[test]
+fn tail_loss_small_segment_size() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+
+    // No datagrams frames received in the handshake.
+    let server_stats = pair.server_conn_mut(server_ch).stats();
+    assert_eq!(server_stats.frame_rx.datagram, 0);
+
+    const DGRAM_LEN: usize = 1000; // Below INITIAL_MTU after packet overhead.
+    const DGRAM_NUM: u64 = 5; // Enough to build a GSO batch.
+
+    info!("Sending an ack-eliciting datagram");
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+
+    // Drop these packets on the server side.
+    assert!(!pair.server.inbound.is_empty());
+    pair.server.inbound.clear();
+
+    // Doing one step makes the client advance time to the PTO fire time.
+    info!("stepping forward to PTO");
+    pair.step();
+
+    // Still no datagrams frames received by the server.
+    let server_stats = pair.server_conn_mut(server_ch).stats();
+    assert_eq!(server_stats.frame_rx.datagram, 0);
+
+    // Now we can send another batch of datagrams, so the PTO can send them instead of
+    // sending a ping.  These are small enough that the segment_size is less than the
+    // INITIAL_MTU.
+    info!("Sending datagram batch");
+    for _ in 0..DGRAM_NUM {
+        pair.client_datagrams(client_ch)
+            .send(vec![0; DGRAM_LEN].into(), false)
+            .unwrap();
+    }
+
+    // If this succeeds the datagrams are received by the server and the client did not
+    // crash.
+    pair.drive();
+
+    // Finally the server should have received some datagrams.
+    let server_stats = pair.server_conn_mut(server_ch).stats();
+    assert_eq!(server_stats.frame_rx.datagram, DGRAM_NUM);
+}
+
+// Respect max_datagrams when TLP happens
+#[test]
+fn tail_loss_respect_max_datagrams() {
+    let _guard = subscribe();
+    let client_config = {
+        let mut c_config = client_config();
+        let mut t_config = TransportConfig::default();
+        //Disabling GSO, so only a single segment should be sent per iops
+        t_config.enable_segmentation_offload(false);
+        c_config.transport_config(t_config.into());
+        c_config
+    };
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(client_config);
+
+    const DGRAM_LEN: usize = 1000; // High enough so GSO batch could be built
+    const DGRAM_NUM: u64 = 5; // Enough to build a GSO batch.
+
+    info!("Sending an ack-eliciting datagram");
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+
+    // Drop these packets on the server side.
+    assert!(!pair.server.inbound.is_empty());
+    pair.server.inbound.clear();
+
+    // Doing one step makes the client advance time to the PTO fire time.
+    info!("stepping forward to PTO");
+    pair.step();
+
+    // start sending datagram batches but the first should be a TLP
+    info!("Sending datagram batch");
+    for _ in 0..DGRAM_NUM {
+        pair.client_datagrams(client_ch)
+            .send(vec![0; DGRAM_LEN].into(), false)
+            .unwrap();
+    }
+
+    pair.drive();
+
+    // Finally checking the number of sent udp datagrams match the number of iops
+    let client_stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(client_stats.udp_tx.ios, client_stats.udp_tx.datagrams);
+}
+
 #[test]
 fn datagram_send_recv() {
     let _guard = subscribe();
@@ -1890,7 +1984,7 @@ fn large_initial() {
     );
     assert_matches!(
         pair.client_conn_mut(client_ch).poll(),
-        Some(Event::Connected { .. })
+        Some(Event::Connected)
     );
     assert_matches!(
         pair.server_conn_mut(server_ch).poll(),
@@ -1898,7 +1992,7 @@ fn large_initial() {
     );
     assert_matches!(
         pair.server_conn_mut(server_ch).poll(),
-        Some(Event::Connected { .. })
+        Some(Event::Connected)
     );
 }
 
@@ -2082,7 +2176,7 @@ fn handshake_anti_deadlock_probe() {
     );
     assert_matches!(
         pair.client_conn_mut(client_ch).poll(),
-        Some(Event::Connected { .. })
+        Some(Event::Connected)
     );
 }
 
@@ -2112,7 +2206,7 @@ fn server_can_send_3_inital_packets() {
     );
     assert_matches!(
         pair.client_conn_mut(client_ch).poll(),
-        Some(Event::Connected { .. })
+        Some(Event::Connected)
     );
 }
 

@@ -37,12 +37,17 @@ mod varint;
 
 pub use varint::{VarInt, VarIntBoundsExceeded};
 
+#[cfg(feature = "bloom")]
+mod bloom_token_log;
+#[cfg(feature = "bloom")]
+pub use bloom_token_log::BloomTokenLog;
+
 mod connection;
 pub use crate::connection::{
-    BytesSource, Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats,
-    Datagrams, Event, FinishError, FrameStats, PathStats, ReadError, ReadableError, RecvStream,
-    RttEstimator, SendDatagramError, SendStream, ShouldTransmit, StreamEvent, Streams, UdpStats,
-    WriteError, Written,
+    Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, Datagrams, Event,
+    FinishError, FrameStats, PathStats, ReadError, ReadableError, RecvStream, RttEstimator,
+    SendDatagramError, SendStream, ShouldTransmit, StreamEvent, Streams, UdpStats, WriteError,
+    Written,
 };
 
 #[cfg(feature = "rustls")]
@@ -87,6 +92,9 @@ pub use crate::cid_generator::{
 mod token;
 use token::ResetToken;
 pub use token::{NoneTokenLog, NoneTokenStore, TokenLog, TokenReuseError, TokenStore};
+
+mod token_memory_cache;
+pub use token_memory_cache::TokenMemoryCache;
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
@@ -243,7 +251,7 @@ impl fmt::Display for StreamId {
 impl StreamId {
     /// Create a new StreamId
     pub fn new(initiator: Side, dir: Dir, index: u64) -> Self {
-        Self(index << 2 | (dir as u64) << 1 | initiator as u64)
+        Self((index << 2) | ((dir as u64) << 1) | initiator as u64)
     }
     /// Which side of a connection initiated the stream
     pub fn initiator(self) -> Side {
@@ -255,11 +263,7 @@ impl StreamId {
     }
     /// Which directions data flows in
     pub fn dir(self) -> Dir {
-        if self.0 & 0x2 == 0 {
-            Dir::Bi
-        } else {
-            Dir::Uni
-        }
+        if self.0 & 0x2 == 0 { Dir::Bi } else { Dir::Uni }
     }
     /// Distinguishes streams of the same initiator and directionality
     pub fn index(self) -> u64 {

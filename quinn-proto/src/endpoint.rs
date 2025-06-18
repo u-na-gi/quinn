@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{HashMap, hash_map},
     convert::TryFrom,
     fmt, mem,
     net::{IpAddr, SocketAddr},
@@ -8,13 +8,15 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 use rustc_hash::FxHashMap;
 use slab::Slab;
 use thiserror::Error;
 use tracing::{debug, error, trace, warn};
 
 use crate::{
+    Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, ResetToken,
+    Side, Transmit, TransportConfig, TransportError,
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
@@ -31,8 +33,6 @@ use crate::{
     },
     token::{IncomingToken, InvalidRetryTokenError, Token, TokenPayload},
     transport_parameters::{PreferredAddress, TransportParameters},
-    Duration, Instant, ResetToken, Side, Transmit, TransportConfig, TransportError, INITIAL_MTU,
-    MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE,
 };
 
 /// The main entry point to the library
@@ -282,7 +282,10 @@ impl Endpoint {
         let max_padding_len = match inciting_dgram_len.checked_sub(RESET_TOKEN_SIZE) {
             Some(headroom) if headroom > MIN_PADDING_LEN => headroom - 1,
             _ => {
-                debug!("ignoring unexpected {} byte packet: not larger than minimum stateless reset size", inciting_dgram_len);
+                debug!(
+                    "ignoring unexpected {} byte packet: not larger than minimum stateless reset size",
+                    inciting_dgram_len
+                );
                 return None;
             }
         };
@@ -303,7 +306,7 @@ impl Endpoint {
         buf.reserve(padding_len + RESET_TOKEN_SIZE);
         buf.resize(padding_len, 0);
         self.rng.fill_bytes(&mut buf[0..padding_len]);
-        buf[0] = 0b0100_0000 | buf[0] >> 2;
+        buf[0] = 0b0100_0000 | (buf[0] >> 2);
         buf.extend_from_slice(&ResetToken::new(&*self.config.reset_key, dst_cid));
 
         debug_assert!(buf.len() < inciting_dgram_len);
@@ -399,7 +402,7 @@ impl Endpoint {
     fn new_cid(&mut self, ch: ConnectionHandle) -> ConnectionId {
         loop {
             let cid = self.local_cid_generator.generate_cid();
-            if cid.len() == 0 {
+            if cid.is_empty() {
                 // Zero-length CID; nothing to track
                 debug_assert_eq!(self.local_cid_generator.cid_len(), 0);
                 return cid;
@@ -513,6 +516,8 @@ impl Endpoint {
     }
 
     /// Attempt to accept this incoming connection (an error may still occur)
+    // AcceptError cannot be made smaller without semver breakage
+    #[allow(clippy::result_large_err)]
     pub fn accept(
         &mut self,
         mut incoming: Incoming,
@@ -718,7 +723,7 @@ impl Endpoint {
     /// Errors if `incoming.may_retry()` is false.
     pub fn retry(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Result<Transmit, RetryError> {
         if !incoming.may_retry() {
-            return Err(RetryError(incoming));
+            return Err(RetryError(Box::new(incoming)));
         }
 
         self.clean_up_incoming(&incoming);
@@ -993,7 +998,7 @@ struct ConnectionIndex {
 impl ConnectionIndex {
     /// Associate an incoming connection with its initial destination CID
     fn insert_initial_incoming(&mut self, dst_cid: ConnectionId, incoming_key: usize) {
-        if dst_cid.len() == 0 {
+        if dst_cid.is_empty() {
             return;
         }
         self.connection_ids_initial
@@ -1002,7 +1007,7 @@ impl ConnectionIndex {
 
     /// Remove an association with an initial destination CID
     fn remove_initial(&mut self, dst_cid: ConnectionId) {
-        if dst_cid.len() == 0 {
+        if dst_cid.is_empty() {
             return;
         }
         let removed = self.connection_ids_initial.remove(&dst_cid);
@@ -1011,7 +1016,7 @@ impl ConnectionIndex {
 
     /// Associate a connection with its initial destination CID
     fn insert_initial(&mut self, dst_cid: ConnectionId, connection: ConnectionHandle) {
-        if dst_cid.len() == 0 {
+        if dst_cid.is_empty() {
             return;
         }
         self.connection_ids_initial
@@ -1067,7 +1072,7 @@ impl ConnectionIndex {
 
     /// Find the existing connection that `datagram` should be routed to, if any
     fn get(&self, addresses: &FourTuple, datagram: &PartialDecode) -> Option<RouteDatagramTo> {
-        if datagram.dst_cid().len() != 0 {
+        if !datagram.dst_cid().is_empty() {
             if let Some(&ch) = self.connection_ids.get(datagram.dst_cid()) {
                 return Some(RouteDatagramTo::Connection(ch));
             }
@@ -1077,7 +1082,7 @@ impl ConnectionIndex {
                 return Some(ch);
             }
         }
-        if datagram.dst_cid().len() == 0 {
+        if datagram.dst_cid().is_empty() {
             if let Some(&ch) = self.incoming_connection_remotes.get(addresses) {
                 return Some(RouteDatagramTo::Connection(ch));
             }
@@ -1221,8 +1226,10 @@ impl IncomingImproperDropWarner {
 
 impl Drop for IncomingImproperDropWarner {
     fn drop(&mut self) {
-        warn!("quinn_proto::Incoming dropped without passing to Endpoint::accept/refuse/retry/ignore \
-               (may cause memory leak and eventual inability to accept new connections)");
+        warn!(
+            "quinn_proto::Incoming dropped without passing to Endpoint::accept/refuse/retry/ignore \
+               (may cause memory leak and eventual inability to accept new connections)"
+        );
     }
 }
 
@@ -1271,12 +1278,12 @@ pub struct AcceptError {
 /// Error for attempting to retry an [`Incoming`] which already bears a token from a previous retry
 #[derive(Debug, Error)]
 #[error("retry() with validated Incoming")]
-pub struct RetryError(Incoming);
+pub struct RetryError(Box<Incoming>);
 
 impl RetryError {
     /// Get the [`Incoming`]
     pub fn into_incoming(self) -> Incoming {
-        self.0
+        *self.0
     }
 }
 
